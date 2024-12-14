@@ -16,7 +16,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd) # batch of K,Q,V projections for all heads
 
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-
+        self.c_proj.SCALE_INIT = 1 #sets a flag for this module as it needs a different initialization 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
@@ -50,6 +50,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate = 'tanh') #gaussion error linear units. using approximation to reproduce gpt-2
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.SCALE_INIT = 1 #flags as in attention
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -97,7 +98,26 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+        #weight sharing scheme. We want the embedding matrix to be shared with the linear layer in the end of the transformer ("embedding to be symetrical to disembedding" as I get it)
+        self.transformer.wte.weight = self.lm_head.weight #redirects wte.weight to lm_head (points to lm_head) / weights are shared. Reduces parameters substantially 
+
+        #parameter initialization
+        self.apply(self.__init_weights) #iterates all submodules and applies init_weights
+
+    def __init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.02 #as in openai implentation. Can be justified as 0.02 close to typical 1/sqrt(dmodel)
+            if hasattr(module, 'SCALE_INIT'):#if it is flagged. Projections to residual layer are flagged and initialized differently
+                std *= (2*self.config.n_layer)**(-0.5) # every layer has two blocks that add to residual pathway (attn and mlp), hence 2*self.n_layer is the number contributions to residual pathway
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std) #samples weights from a normal distribution
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias) #initializes the bias terms as 0s
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean = 0.0, std=0.02) #same as above for embedding layers
+
+
+
+    def forward(self, idx, targets=None):
         #idx: (B,T)
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward seq of len {T}, block size is {self.config.block_size}"
@@ -113,8 +133,10 @@ class GPT(nn.Module):
         x = self.transformer.ln_f(x)
         #forward classifier
         logits = self.lm_head(x) #(B,T,vocab_size)
-
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) #logits flattened out (B*T, vocab_size) and targets (B*T)
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -167,16 +189,79 @@ class GPT(nn.Module):
     
 
 #---------------------------------------------------------------------
+import tiktoken
+
+class DataLoaderLite:
+    def __init__(self,B,T):
+        self.B = B
+        self.T = T
+
+        #load tokens from disk and store them in memory
+        with open("shakespeare.txt", "r") as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2') #generating tokenizer
+        tokens = enc.encode(text) #encoding text
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens)//(B*T)} batches")
+
+        #state
+        self.current_position = 0
+    
+    def next_batch(self):
+        B, T = self.B, self.T 
+        buf = self.tokens[self.current_position : self.current_position+B*T+1] #creates unidimensional tensor containing what will become inputs and labels for the batch
+        x = (buf[:-1]).view(B,T) #creates inputs (B,T)
+        y = (buf[1:]).view(B,T) #creates labels (B,T)
+        # update state / advance position in the tensor
+        self.current_position += B*T
+        # reset of out of bounds
+        if self.current_position + (B*T+1) > len(self.tokens):
+            self.current_position = 0
+        return x,y
+
+#--------------------------------------------------------------------------------------------------
+#Training
+
+#checking device
+device = 'cpu'
+if torch.cuda.is_available():
+    device = 'cuda'
+print('using device: ', device)
+
+#seeds for reproducibility
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+#genereating data loader
+train_loader = DataLoaderLite(B=4, T=32)
+
+#get logits
+model = GPT(GPTConfig())
+model.to(device)
+
+#optimize
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    x,y = train_loader.next_batch() #loading batch
+    x,y = x.to(device), y.to(device)
+    optimizer.zero_grad()
+    logits, loss = model(x,y)
+    loss.backward()
+    optimizer.step()
+    print(f'step {i}, loss: {loss.item()}') #loss is a tensor with single value on the gpu, .item brings back to cpu and converts to float
+
+
+
+
+import sys; sys.exit(0)
+#-----------------------------------------------------------
+model.eval()
+
 num_return_sequences = 5
 max_length = 30
 
-model = GPT.from_pretrained('gpt2')
-model.eval()
-model.to('cuda')
-
-#tokenization
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
 #prefix tokens (to start generation)
 tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long) #(T,)
